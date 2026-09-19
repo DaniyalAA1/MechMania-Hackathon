@@ -98,14 +98,30 @@ def _ring_point(center: Vec2, deg: float, radius: float) -> Vec2:
 
 
 def formation_slot(
-    center: Vec2, index: int, count: int, conf: GameConfig, disperse: float = 1.0
+    center: Vec2,
+    index: int,
+    count: int,
+    conf: GameConfig,
+    disperse: float = 1.0,
+    max_radius: Optional[float] = None,
+    min_radius: Optional[float] = None,
 ) -> Vec2:
-    """Rings around `center`, spaced so one splash cannot chain us. Still in capture."""
+    """Rings around `center`, spaced so one splash cannot chain us."""
     if count <= 0:
         return center
     sep = (splash_cluster_range(conf) + 0.22) * max(disperse, 1.0)
-    max_r = conf.payload.capture_radius - conf.bot.radius - 0.15
-    min_r = conf.payload.radius + conf.bot.radius + 0.25
+    max_r = (
+        conf.payload.capture_radius - conf.bot.radius - 0.15
+        if max_radius is None
+        else max_radius
+    )
+    min_r = (
+        conf.payload.radius + conf.bot.radius + 0.25
+        if min_radius is None
+        else min_radius
+    )
+    if max_r < min_r:
+        min_r = max(max_r * 0.35, 0.2)
 
     rings = []
     remaining = count
@@ -142,9 +158,15 @@ def toward(frm: Vec2, to: Vec2, dist: float) -> Vec2:
     return frm + delta.normalize_or_zero() * dist
 
 
-def pick_focus(enemies, payload: Vec2, our_deposit: Vec2, raid: bool):
+def pick_focus(enemies, payload: Vec2, our_deposit: Vec2, raid: bool, skirmish: bool = False):
     if not enemies:
         return None
+    if skirmish:
+        combat = [e for e in enemies if e.class_ != BotClass.Extractor]
+        pool = combat or enemies
+        near = [e for e in pool if e.pos.dist_sq(payload) <= 14.0 * 14.0] or pool
+        return min(near, key=lambda e: (e.health, e.pos.dist_sq(payload)))
+
     miners = [e for e in enemies if e.class_ == BotClass.Extractor]
 
     def miner_key(e):
@@ -162,7 +184,9 @@ def pick_focus(enemies, payload: Vec2, our_deposit: Vec2, raid: bool):
     return min(near, key=lambda e: (e.health, e.pos.dist_sq(payload)))
 
 
-def assign_splash_shots(shooters, enemies, state: GameState, conf: GameConfig, focus=None):
+def assign_splash_shots(
+    shooters, enemies, state: GameState, conf: GameConfig, focus=None, skirmish: bool = False
+):
     """Everyone hunts the focus neighborhood. One shot per hull per tick (invuln)."""
     cluster_r = splash_cluster_range(conf)
     cluster_r_sq = cluster_r * cluster_r
@@ -186,7 +210,8 @@ def assign_splash_shots(shooters, enemies, state: GameState, conf: GameConfig, f
                     clump += 1
             near_focus = 0
             our_side_miner = (
-                enemy.class_ == BotClass.Extractor
+                not skirmish
+                and enemy.class_ == BotClass.Extractor
                 and (enemy.pos.y >= (MAP_SIZE * 0.5))
             )
             if our_side_miner:
@@ -199,7 +224,8 @@ def assign_splash_shots(shooters, enemies, state: GameState, conf: GameConfig, f
                 elif enemy.pos.dist_sq(focus.pos) <= cluster_r_sq * 25:
                     near_focus = max(near_focus, 1)
             on_cart = enemy.pos.dist_sq(payload) <= cart_r_sq
-            key = (near_focus, on_cart, clump, -enemy.health)
+            combat = 0 if (skirmish and enemy.class_ == BotClass.Extractor) else 1
+            key = (combat, near_focus, on_cart, clump, -enemy.health)
             if best is None or key > best:
                 best = key
                 target = enemy
@@ -251,6 +277,59 @@ def can_heal(healer: BotState, ally: BotState, conf: GameConfig) -> bool:
 
 def move_towards(bot_action, frm: Vec2, to: Vec2) -> None:
     bot_action.move_action = move_bot(navigate_to(frm, to))
+
+
+def is_critical(bot: BotState, conf: GameConfig) -> bool:
+    """One blast from dead. Do not retreat on a chip shot."""
+    return bot.health <= conf.bot.blaster_damage + 0.05
+
+
+def nearest_healer_spot(bot: BotState, healers, heal_anchor: Vec2, spawn: Vec2, conf: GameConfig) -> Vec2:
+    if not healers:
+        return toward(heal_anchor, spawn, 1.2)
+    healer = closest(bot.pos, healers)
+    return toward(healer.pos, spawn, min(0.6, conf.bot.base_heal_range * 0.25))
+
+
+def assign_retreat_dests(
+    battle,
+    healers,
+    dests: dict,
+    slots: dict,
+    heal_anchor: Vec2,
+    payload: Vec2,
+    spawn: Vec2,
+    conf: GameConfig,
+    raid: bool,
+    skirmish: bool = False,
+) -> dict:
+    """Hurt guns step behind to a healer. A healthy gun nearby takes the front."""
+    out = dict(dests)
+    lethal = [b for b in battle if is_critical(b, conf)]
+    healthy = sorted(
+        [b for b in battle if not is_critical(b, conf)],
+        key=lambda b: -b.health,
+    )
+    taken = set()
+    swap_r = 8.0
+
+    for hurt in sorted(lethal, key=lambda b: b.health):
+        out[hurt.id] = nearest_healer_spot(hurt, healers, heal_anchor, spawn, conf)
+        partner = None
+        for cand in healthy:
+            if cand.id in taken:
+                continue
+            if cand.pos.dist(hurt.pos) <= swap_r:
+                partner = cand
+                break
+        if partner is not None:
+            taken.add(partner.id)
+            out[partner.id] = dests.get(hurt.id, slots.get(hurt.id, payload))
+
+    if not healthy and lethal and not raid and not skirmish:
+        tank = max(lethal, key=lambda b: b.health)
+        out[tank.id] = toward(payload, spawn, 0.9)
+    return out
 
 
 def act_extractor(bot, bot_action, spot: Vec2, deposit: Vec2) -> None:

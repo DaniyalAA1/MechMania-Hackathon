@@ -3,11 +3,14 @@ from .tactics import (
     act_battle,
     act_extractor,
     act_healer,
+    assign_retreat_dests,
     assign_splash_shots,
     by_class,
     closest,
     formation_slot,
+    is_critical,
     mining_spot,
+    nearest_healer_spot,
     pick_focus,
     spawn_pos,
     toward,
@@ -15,11 +18,14 @@ from .tactics import (
 
 
 class Brain:
-    """Max bodies. 4+ miners that never flee. Raid if behind on miners. Hold a payload lead."""
+    """Win the first lane fight at range, then sit cart. Miners never flee. 1:2 healers."""
 
     def __init__(self) -> None:
         self.heal_lock = {}
         self.had_lead = False
+        self.won_field = False
+        self.saw_army = False
+        self.lane_hp = 0.0
 
     def __call__(self, state: GameState) -> FleetAction:
         conf = get_config()
@@ -40,10 +46,42 @@ class Brain:
 
         n_ext, n_heal, n_battle = len(extractors), len(healers), len(battle)
         n_enemy_ext = len(enemy_miners)
-        raid = (not in_endgame) and n_enemy_ext > n_ext
+
+        lane_r = conf.bot.blaster_range + conf.payload.capture_radius + 4.0
+        wave_r = conf.bot.blaster_range * 2.0 + conf.payload.capture_radius
+        local_enemy = [
+            e
+            for e in enemies
+            if e.class_ != BotClass.Extractor and e.pos.dist(payload) <= lane_r
+        ]
+        wave = [
+            e
+            for e in enemies
+            if e.class_ != BotClass.Extractor and e.pos.dist(payload) <= wave_r
+        ]
+        our_hp = sum(b.health for b in battle) + sum(h.health for h in healers)
+        en_hp = sum(e.health for e in local_enemy)
+        wave_hp = sum(e.health for e in wave)
+        dying = bool(local_enemy) and en_hp < self.lane_hp * 0.92
+        self.lane_hp = en_hp
+
+        if wave:
+            self.saw_army = True
+            if n_battle < 3 and len(wave) >= 2:
+                self.won_field = False
+            elif n_battle >= 3 and len(wave) <= 1:
+                self.won_field = True
+            elif n_battle >= 4 and our_hp >= wave_hp * 1.5 and len(wave) <= 2:
+                self.won_field = True
+        elif self.saw_army:
+            self.won_field = True
+
+        skirmish = (not in_endgame) and (not self.won_field)
+        raid = (not in_endgame) and (not skirmish) and n_enemy_ext > n_ext
         hold = (
             not in_endgame
             and not raid
+            and not skirmish
             and self.had_lead
             and capture >= -0.06
         )
@@ -55,20 +93,19 @@ class Brain:
                 want_extractors = max(want_extractors, n_enemy_ext + 1, 5)
             want_extractors = min(want_extractors, 8)
 
-        want_healers = 0
-        if n_battle >= 6:
-            want_healers = 1
-        if n_battle >= 12:
-            want_healers = 2
+        # 1 healer : 2 fighters. Fill as the army grows, not a late sprinkle.
+        want_healers = max(1, n_battle // 2) if n_battle >= 2 else 0
 
         if n_ext < 1:
             next_bot = BotClass.Extractor
         elif n_battle < 4:
             next_bot = BotClass.Battle
-        elif n_ext < want_extractors:
+        elif n_ext < 4:
             next_bot = BotClass.Extractor
         elif n_heal < want_healers:
             next_bot = BotClass.Healer
+        elif n_ext < want_extractors:
+            next_bot = BotClass.Extractor
         else:
             next_bot = BotClass.Battle
         action.fabricator_next = int(next_bot)
@@ -88,12 +125,20 @@ class Brain:
             for i, bot in enumerate(extractors)
         }
 
-        focus = pick_focus(enemies, payload, deposit, raid)
-        shots = assign_splash_shots(battle, enemies, state, conf, focus=focus)
+        focus = pick_focus(enemies, payload, deposit, raid, skirmish=skirmish)
+        shots = assign_splash_shots(
+            battle, enemies, state, conf, focus=focus, skirmish=skirmish
+        )
 
+        ring_r = None
         if raid and focus is not None:
             anchor = focus.pos
             disperse = 1.0
+        elif skirmish:
+            stand = conf.bot.blaster_range * 0.62
+            anchor = toward(payload, spawn, stand)
+            disperse = 1.25
+            ring_r = min(1.55, conf.bot.base_heal_range * 0.5)
         elif hold:
             anchor = toward(payload, spawn, 0.9)
             disperse = 1.45
@@ -106,16 +151,60 @@ class Brain:
             payload_crew.extend(extractors)
         payload_crew = sorted(payload_crew, key=lambda b: b.id)
         slots = {
-            b.id: formation_slot(anchor, i, len(payload_crew), conf, disperse=disperse)
+            b.id: formation_slot(
+                anchor, i, len(payload_crew), conf, disperse=disperse, max_radius=ring_r
+            )
             for i, b in enumerate(payload_crew)
         }
 
         heal_anchor = toward(anchor, spawn, min(conf.bot.base_heal_range * 0.65, 1.8))
         healers_sorted = sorted(healers, key=lambda b: b.id)
         heal_slots = {
-            h.id: formation_slot(heal_anchor, i, max(len(healers_sorted), 1), conf, disperse=1.2)
+            h.id: formation_slot(
+                heal_anchor,
+                i,
+                max(len(healers_sorted), 1),
+                conf,
+                disperse=1.2,
+                max_radius=ring_r,
+            )
             for i, h in enumerate(healers_sorted)
         }
+
+        dests = {}
+        for i, bot in enumerate(sorted(battle, key=lambda b: b.id)):
+            if raid and focus is not None:
+                dests[bot.id] = formation_slot(focus.pos, i, max(n_battle, 1), conf)
+            else:
+                dests[bot.id] = slots.get(bot.id, anchor)
+
+        peel = skirmish and capture < -0.25 and len(local_enemy) >= 2 and not dying
+        if peel and battle:
+            rim = toward(
+                payload,
+                spawn,
+                max(conf.payload.capture_radius - conf.bot.radius - 0.2, 0.6),
+            )
+            peel_n = max(1, n_battle // 3)
+            peel_bots = [b for b in sorted(battle, key=lambda b: -b.health) if not is_critical(b, conf)]
+            peel_bots = peel_bots[:peel_n]
+            for i, bot in enumerate(peel_bots):
+                dests[bot.id] = formation_slot(
+                    rim, i, max(len(peel_bots), 1), conf, disperse=1.2, max_radius=0.9, min_radius=0.35
+                )
+
+        dests = assign_retreat_dests(
+            battle,
+            healers,
+            dests,
+            slots,
+            heal_anchor,
+            payload,
+            spawn,
+            conf,
+            raid,
+            skirmish=skirmish,
+        )
 
         heal_counts = {}
 
@@ -133,15 +222,16 @@ class Brain:
                 if heal_counts.get(ally.id, 0) >= cap:
                     continue
                 wounded.append(ally)
+            # Weakest first (hurt healers included). Break ties by how close they are.
 
             target = None
             if locked is not None and locked.health < conf.bot.health * 0.98:
                 if heal_counts.get(locked.id, 0) < cap:
-                    worst = min(wounded, key=lambda a: a.health) if wounded else None
+                    worst = min(wounded, key=lambda a: (a.health, healer.pos.dist_sq(a.pos))) if wounded else None
                     if worst is None or worst.health >= locked.health - 2.0:
                         target = locked
             if target is None and wounded:
-                target = min(wounded, key=lambda a: a.health)
+                target = min(wounded, key=lambda a: (a.health, healer.pos.dist_sq(a.pos)))
             if target is None:
                 if locked is not None:
                     target = locked
@@ -177,13 +267,14 @@ class Brain:
 
             if bot.class_ == BotClass.Healer:
                 fallback = heal_slots.get(bot.id, toward(anchor, spawn, 1.5))
+                if is_critical(bot, conf):
+                    others = [h for h in healers if h.id != bot.id]
+                    fallback = nearest_healer_spot(bot, others, heal_anchor, spawn, conf)
                 act_healer(bot, bot_action, healer_target(bot), fallback, conf)
                 continue
 
             shoot, fire = shots.get(bot.id, (opp, True))
-            dest = slots.get(bot.id, anchor)
-            if raid and focus is not None:
-                dest = formation_slot(focus.pos, bot.id, max(n_battle, 1), conf)
+            dest = dests.get(bot.id, slots.get(bot.id, anchor))
             act_battle(bot, bot_action, dest, shoot, state, conf, fire=fire)
 
         return action
