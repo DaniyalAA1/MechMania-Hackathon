@@ -140,9 +140,7 @@ class Brain:
                     bot_action.turn_action = turn_towards(payload)
                     bot_action.special_action = SpecialAction.Extractor(mine=False)
                 else:
-                    threatened = any(
-                        e.pos.dist(bot.pos) <= conf.bot.blaster_range for e in enemies
-                    )
+                    threatened = False  # miners never flee: stay on the node and mine
                     act_extractor(
                         bot,
                         bot_action,
