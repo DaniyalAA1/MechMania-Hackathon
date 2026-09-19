@@ -150,8 +150,10 @@ def assign_splash_shots(shooters, enemies, state: GameState, conf: GameConfig):
             for other in enemies:
                 if other.id != enemy.id and enemy.pos.dist_sq(other.pos) <= cluster_r_sq:
                     clump += 1
-            # Bigger clump first, then closer to us, then lower HP.
-            key = (clump, -bot.pos.dist_sq(enemy.pos), -enemy.health)
+            # Anyone standing on the cart first: one contester freezes the whole push, so
+            # clearing them is what gets it moving. Then bigger clump, closer, lower HP.
+            key = (enemy.pos.dist_sq(payload) <= conf.payload.capture_radius ** 2,
+                   clump, -bot.pos.dist_sq(enemy.pos), -enemy.health)
             if best is None or key > best:
                 best = key
                 target = enemy
