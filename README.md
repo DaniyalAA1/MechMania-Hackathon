@@ -1,6 +1,6 @@
 # CrunchTime — MechMania 32 (Deliverable)
 
-UIUC hackathon bot. Team: Daniyal, Manashyu (Abhinav left).
+UIUC hackathon bot. Team: Daniyal, Manashyu .
 
 Only `strategy/` is submitted. `main` is the tournament bot (v11):
 
