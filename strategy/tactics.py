@@ -97,11 +97,13 @@ def _ring_point(center: Vec2, deg: float, radius: float) -> Vec2:
     return slot
 
 
-def formation_slot(center: Vec2, index: int, count: int, conf: GameConfig) -> Vec2:
+def formation_slot(
+    center: Vec2, index: int, count: int, conf: GameConfig, disperse: float = 1.0
+) -> Vec2:
     """Rings around `center`, spaced so one splash cannot chain us. Still in capture."""
     if count <= 0:
         return center
-    sep = splash_cluster_range(conf) + 0.22
+    sep = (splash_cluster_range(conf) + 0.22) * max(disperse, 1.0)
     max_r = conf.payload.capture_radius - conf.bot.radius - 0.15
     min_r = conf.payload.radius + conf.bot.radius + 0.25
 
@@ -129,16 +131,48 @@ def formation_slot(center: Vec2, index: int, count: int, conf: GameConfig) -> Ve
     return center
 
 
-def assign_splash_shots(shooters, enemies, state: GameState, conf: GameConfig):
-    """One gun per clump per tick. Extra shots on the same pile are wasted to invuln."""
+def spawn_pos(conf: GameConfig) -> Vec2:
+    return Vec2(conf.bot.radius + 0.2, MAP_SIZE - conf.bot.radius - 0.2)
+
+
+def toward(frm: Vec2, to: Vec2, dist: float) -> Vec2:
+    delta = to - frm
+    if delta.norm_sq() < 1e-12:
+        return frm
+    return frm + delta.normalize_or_zero() * dist
+
+
+def pick_focus(enemies, payload: Vec2, our_deposit: Vec2, raid: bool):
+    if not enemies:
+        return None
+    miners = [e for e in enemies if e.class_ == BotClass.Extractor]
+
+    def miner_key(e):
+        # Mirrored frame: our half is high y; our node is deposit_me.
+        our_side = e.pos.y >= (MAP_SIZE * 0.5) or e.pos.dist(our_deposit) <= 10.0
+        return (0 if our_side else 1, e.pos.dist_sq(our_deposit), e.health)
+
+    if miners:
+        if raid:
+            return min(miners, key=miner_key)
+        home = [e for e in miners if miner_key(e)[0] == 0]
+        if home:
+            return min(home, key=miner_key)
+    near = [e for e in enemies if e.pos.dist_sq(payload) <= 12.0 * 12.0] or enemies
+    return min(near, key=lambda e: (e.health, e.pos.dist_sq(payload)))
+
+
+def assign_splash_shots(shooters, enemies, state: GameState, conf: GameConfig, focus=None):
+    """Everyone hunts the focus neighborhood. One shot per hull per tick (invuln)."""
     cluster_r = splash_cluster_range(conf)
     cluster_r_sq = cluster_r * cluster_r
     claimed = set()
     shots = {}
     payload = state.payload_pos()
+    cart_r_sq = conf.payload.capture_radius ** 2
     ready = sorted(
         shooters,
-        key=lambda b: (b.next_fire_tick > state.tick, b.pos.dist_sq(payload)),
+        key=lambda b: (b.next_fire_tick > state.tick, b.pos.dist_sq((focus or b).pos)),
     )
     for bot in ready:
         target = None
@@ -150,16 +184,28 @@ def assign_splash_shots(shooters, enemies, state: GameState, conf: GameConfig):
             for other in enemies:
                 if other.id != enemy.id and enemy.pos.dist_sq(other.pos) <= cluster_r_sq:
                     clump += 1
-            # Anyone standing on the cart first: one contester freezes the whole push, so
-            # clearing them is what gets it moving. Then bigger clump, closer, lower HP.
-            key = (enemy.pos.dist_sq(payload) <= conf.payload.capture_radius ** 2,
-                   clump, -bot.pos.dist_sq(enemy.pos), -enemy.health)
+            near_focus = 0
+            our_side_miner = (
+                enemy.class_ == BotClass.Extractor
+                and (enemy.pos.y >= (MAP_SIZE * 0.5))
+            )
+            if our_side_miner:
+                near_focus = 4
+            if focus is not None:
+                if enemy.id == focus.id:
+                    near_focus = max(near_focus, 5)
+                elif enemy.pos.dist_sq(focus.pos) <= cluster_r_sq * 9:
+                    near_focus = max(near_focus, 2)
+                elif enemy.pos.dist_sq(focus.pos) <= cluster_r_sq * 25:
+                    near_focus = max(near_focus, 1)
+            on_cart = enemy.pos.dist_sq(payload) <= cart_r_sq
+            key = (near_focus, on_cart, clump, -enemy.health)
             if best is None or key > best:
                 best = key
                 target = enemy
         fire = target is not None
         if target is None:
-            target = closest(bot.pos, enemies)
+            target = focus or closest(bot.pos, enemies)
         else:
             claimed.add(target.id)
             for other in enemies:
@@ -207,11 +253,10 @@ def move_towards(bot_action, frm: Vec2, to: Vec2) -> None:
     bot_action.move_action = move_bot(navigate_to(frm, to))
 
 
-def act_extractor(bot, bot_action, spot: Vec2, deposit: Vec2, flee_to: Vec2, threatened: bool) -> None:
-    dest = flee_to if threatened else spot
-    move_towards(bot_action, bot.pos, dest)
+def act_extractor(bot, bot_action, spot: Vec2, deposit: Vec2) -> None:
+    move_towards(bot_action, bot.pos, spot)
     bot_action.turn_action = turn_towards(deposit)
-    bot_action.special_action = SpecialAction.Extractor(mine=not threatened)
+    bot_action.special_action = SpecialAction.Extractor(mine=True)
 
 
 def act_healer(bot, bot_action, ally: Optional[BotState], fallback: Vec2, conf: GameConfig) -> None:

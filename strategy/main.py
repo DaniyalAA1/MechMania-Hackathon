@@ -7,16 +7,19 @@ from .tactics import (
     by_class,
     closest,
     formation_slot,
-    home_threats,
     mining_spot,
+    pick_focus,
+    spawn_pos,
+    toward,
 )
 
 
 class Brain:
-    """Blob the payload. Three miners. Peel a few home only if the node is actually dived."""
+    """Max bodies. 4+ miners that never flee. Raid if behind on miners. Hold a payload lead."""
 
     def __init__(self) -> None:
         self.heal_lock = {}
+        self.had_lead = False
 
     def __call__(self, state: GameState) -> FleetAction:
         conf = get_config()
@@ -24,26 +27,43 @@ class Brain:
 
         payload = state.payload_pos()
         deposit = state.deposit_me.pos
+        spawn = spawn_pos(conf)
         enemies = [e for e in state.fleet_other]
         extractors, healers, battle = by_class(state.fleet_me)
+        enemy_miners = [e for e in enemies if e.class_ == BotClass.Extractor]
 
         endgame_start = conf.max_ticks - conf.endgame_ticks
         in_endgame = state.tick >= endgame_start
-        threats = home_threats(state, conf, enemies)
+        capture = state.capture
+        if capture >= 0.10:
+            self.had_lead = True
 
         n_ext, n_heal, n_battle = len(extractors), len(healers), len(battle)
-        want_extractors = 0 if in_endgame else 3
-        # One healer cancels one gun. Two is enough in the clump; a third is a fighter we didn't build.
+        n_enemy_ext = len(enemy_miners)
+        raid = (not in_endgame) and n_enemy_ext > n_ext
+        hold = (
+            not in_endgame
+            and not raid
+            and self.had_lead
+            and capture >= -0.06
+        )
+
+        want_extractors = 0
+        if not in_endgame:
+            want_extractors = max(4, n_enemy_ext)
+            if hold:
+                want_extractors = max(want_extractors, n_enemy_ext + 1, 5)
+            want_extractors = min(want_extractors, 8)
+
         want_healers = 0
         if n_battle >= 6:
             want_healers = 1
         if n_battle >= 12:
             want_healers = 2
 
-        # Get a fighting blob on the road before parking the 2nd/3rd miner.
         if n_ext < 1:
             next_bot = BotClass.Extractor
-        elif n_battle < 6:
+        elif n_battle < 4:
             next_bot = BotClass.Battle
         elif n_ext < want_extractors:
             next_bot = BotClass.Extractor
@@ -64,29 +84,38 @@ class Brain:
 
         extractors = sorted(extractors, key=lambda b: b.id)
         spots = {
-            bot.id: mining_spot(conf, deposit, i, max(n_ext, 3))
+            bot.id: mining_spot(conf, deposit, i, max(n_ext, want_extractors, 4))
             for i, bot in enumerate(extractors)
         }
-        flee_to = closest(deposit, battle).pos if battle else payload
 
-        # ~10% peel, and only while someone is actually on our deposit.
-        n_defend = min(n_battle, max(1, n_battle // 10)) if threats else 0
-        defender_ids = set()
-        defend_index = {}
-        if n_defend:
-            nearest_home = sorted(battle, key=lambda b: b.pos.dist_sq(deposit))
-            defender_ids = {b.id for b in nearest_home[:n_defend]}
-            defend_index = {b.id: i for i, b in enumerate(nearest_home[:n_defend])}
+        focus = pick_focus(enemies, payload, deposit, raid)
+        shots = assign_splash_shots(battle, enemies, state, conf, focus=focus)
 
-        payload_crew = [b for b in battle if b.id not in defender_ids] + list(healers)
+        if raid and focus is not None:
+            anchor = focus.pos
+            disperse = 1.0
+        elif hold:
+            anchor = toward(payload, spawn, 0.9)
+            disperse = 1.45
+        else:
+            anchor = payload
+            disperse = 1.0
+
+        payload_crew = list(battle) + list(healers)
         if in_endgame:
             payload_crew.extend(extractors)
         payload_crew = sorted(payload_crew, key=lambda b: b.id)
-        payload_slots = {
-            b.id: formation_slot(payload, i, len(payload_crew), conf)
+        slots = {
+            b.id: formation_slot(anchor, i, len(payload_crew), conf, disperse=disperse)
             for i, b in enumerate(payload_crew)
         }
-        shots = assign_splash_shots(battle, enemies, state, conf)
+
+        heal_anchor = toward(anchor, spawn, min(conf.bot.base_heal_range * 0.65, 1.8))
+        healers_sorted = sorted(healers, key=lambda b: b.id)
+        heal_slots = {
+            h.id: formation_slot(heal_anchor, i, max(len(healers_sorted), 1), conf, disperse=1.2)
+            for i, h in enumerate(healers_sorted)
+        }
 
         heal_counts = {}
 
@@ -97,9 +126,7 @@ class Brain:
 
             wounded = []
             for ally in state.fleet_me:
-                if ally.id == healer.id:
-                    continue
-                if ally.class_ == BotClass.Extractor:
+                if ally.id == healer.id or ally.class_ == BotClass.Extractor:
                     continue
                 if ally.health >= conf.bot.health * 0.98:
                     continue
@@ -120,7 +147,7 @@ class Brain:
                     target = locked
                 else:
                     blob = [b for b in battle if b.id != healer.id]
-                    target = closest(payload, blob) if blob else None
+                    target = closest(anchor, blob) if blob else None
 
             if target is not None:
                 self.heal_lock[healer.id] = target.id
@@ -135,39 +162,29 @@ class Brain:
 
             if bot.class_ == BotClass.Extractor:
                 if in_endgame:
-                    slot = payload_slots.get(bot.id, payload)
+                    slot = slots.get(bot.id, payload)
                     bot_action.move_action = move_bot(navigate_to(bot.pos, slot))
                     bot_action.turn_action = turn_towards(payload)
                     bot_action.special_action = SpecialAction.Extractor(mine=False)
                 else:
-                    threatened = any(
-                        e.pos.dist(bot.pos) <= conf.bot.blaster_range for e in enemies
-                    )
                     act_extractor(
                         bot,
                         bot_action,
-                        spots.get(bot.id, mining_spot(conf, deposit, 0)),
+                        spots.get(bot.id, mining_spot(conf, deposit, 0, 4)),
                         deposit,
-                        flee_to,
-                        threatened,
                     )
                 continue
 
             if bot.class_ == BotClass.Healer:
-                fallback = payload_slots.get(bot.id, payload)
+                fallback = heal_slots.get(bot.id, toward(anchor, spawn, 1.5))
                 act_healer(bot, bot_action, healer_target(bot), fallback, conf)
                 continue
 
             shoot, fire = shots.get(bot.id, (opp, True))
-            if bot.id in defender_ids and threats:
-                mark = closest(bot.pos, threats)
-                dest = formation_slot(
-                    mark.pos, defend_index.get(bot.id, 0), max(n_defend, 1), conf
-                )
-                act_battle(bot, bot_action, dest, mark, state, conf, fire=True)
-            else:
-                dest = payload_slots.get(bot.id, payload)
-                act_battle(bot, bot_action, dest, shoot, state, conf, fire=fire)
+            dest = slots.get(bot.id, anchor)
+            if raid and focus is not None:
+                dest = formation_slot(focus.pos, bot.id, max(n_battle, 1), conf)
+            act_battle(bot, bot_action, dest, shoot, state, conf, fire=fire)
 
         return action
 
