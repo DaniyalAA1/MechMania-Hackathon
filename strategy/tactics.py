@@ -157,10 +157,14 @@ def assign_splash_shots(shooters, enemies, state: GameState, conf: GameConfig):
             if best is None or key > best:
                 best = key
                 target = enemy
-        fire = target is not None
+        # Only a gun that can actually fire at its pick this tick reserves the clump; one that
+        # is still turning or reloading just aims, and leaves the clump to a gun that can.
+        # Reserving on behalf of a shot that never goes off silences the whole fleet: against a
+        # tight enemy blob two such holds used to cover everyone, and we were outshot 2:1.
+        fire = target is not None and can_blast(bot, target.pos, state, conf)
         if target is None:
             target = closest(bot.pos, enemies)
-        else:
+        elif fire:
             claimed.add(target.id)
             for other in enemies:
                 if target.pos.dist_sq(other.pos) <= cluster_r_sq:
